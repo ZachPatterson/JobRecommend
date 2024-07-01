@@ -1,0 +1,27 @@
+{
+    "python.envFile": "${workspaceFolder}/.env",
+    "tasks": {
+        "version": "2.0.0",
+        "tasks": [
+            {
+                "label": "Load secrets",
+                "type": "shell",
+                "command": "python load_secrets.py",
+                "problemMatcher": []
+            }
+        ]
+    },
+    "launch": {
+        "version": "0.2.0",
+        "configurations": [
+            {
+                "name": "Python: Current File",
+                "type": "python",
+                "request": "launch",
+                "program": "${file}",
+                "console": "integratedTerminal",
+                "preLaunchTask": "Load secrets"
+            }
+        ]
+    }
+}
