@@ -1,146 +1,248 @@
 import streamlit as st
 from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores.redis import Redis as RedisVectorStore
 import pandas as pd
-from bing_image_urls import bing_image_urls
-from langchain.vectorstores.redis import RedisText, RedisNum
 import os
 from dotenv import load_dotenv
+import re
+import numpy as np
+from PIL import Image
+import base64
+from io import BytesIO
+import docx2txt
+from PyPDF2 import PdfReader
+from geopy.distance import geodesic
+from opencage.geocoder import OpenCageGeocode
 
 # Load environment variables from .env file
 load_dotenv()
 
-# ----------Set up Azure OpenAI Embeddings--------------
+# Set up Azure OpenAI Embeddings
 OPENAI_ENDPOINT = os.environ.get("OPENAI_ENDPOINT")
 OPENAI_KEY = os.environ.get("OPENAI_KEY")
 DEPLOYMENT_NAME = os.environ.get("DEPLOYMENT_NAME")
 MODEL_NAME = os.environ.get("MODEL_NAME")
+OPENCAGE_KEY = os.environ.get("OPENCAGE_KEY")
+
+geocoder = OpenCageGeocode(OPENCAGE_KEY)
 
 embedding = OpenAIEmbeddings(
-    deployment= DEPLOYMENT_NAME,        # your name for the model deployment (e.g. "my-ml-model")
-    model= MODEL_NAME,                  # name of the specific ML model (e.g. "text-embedding-ada-002" )
-    openai_api_base= OPENAI_ENDPOINT,
-    openai_api_type= "azure",           # you need this if you're using Azure Open AI service
-    openai_api_key= OPENAI_KEY,
-    openai_api_version= "2023-05-15",
-    chunk_size=16                       # current limit with Azure OpenAI service. This will likely increase in the future.
+    deployment=DEPLOYMENT_NAME,
+    model=MODEL_NAME,
+    openai_api_base=OPENAI_ENDPOINT,
+    openai_api_type="azure",
+    openai_api_key=OPENAI_KEY,
+    openai_api_version="2023-05-15",
+    chunk_size=16
 )
 
-# ----------Set up Redis Vector Store--------------
-index_name = "positionindex"
+# In-memory data store
+data_store = {}
 
-REDIS_ENDPOINT = os.environ.get("REDIS_ENDPOINT") # must include port at the end. e.g. "redisdemo.eastus.redisenterprise.cache.azure.net:10000"
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
+# Function to add data to the store
+def add_to_store(key, value):
+    data_store[key] = value
 
-# create a connection string for the Redis Vector Store. Uses Redis-py format: https://redis-py.readthedocs.io/en/stable/connections.html#redis.Redis.from_url
-# This example assumes TLS is enabled. If not, use "redis://" instead of "rediss://
-redis_url = f"rediss://:{os.environ['REDIS_PASSWORD']}@{os.environ['REDIS_ENDPOINT']}"
+# Load the processed CSV file
+csv_file_path = 'data/Client Knowledge Base Processed.csv'
+df = pd.read_csv(csv_file_path, encoding='ISO-8859-1')
 
-# You'll need to pass in the schema of your Redis Vector Store. You can generate this yaml file when you generate the embeddings and vector store.
-vectorstore = RedisVectorStore.from_existing_index(
-    embedding=embedding,
-    redis_url=redis_url,
-    index_name=index_name,
-    schema="redis_schema.yaml"
-)
+# Add data to the in-memory store with embeddings
+for _, row in df.iterrows():
+    key = f"{row['Client Name']}_{row['Position']}"
+    description = row['Description']
+    embedding_vector = embedding.embed_query(description)
+    add_to_store(key, {
+        'id': row['id'],
+        'company': row['Client Name'],
+        'position': row['Position'],
+        'description': description,
+        'embedding': embedding_vector,
+        'City': row['City'],
+        'Zip': row['Zip'],
+        'Status': row['Status'],
+        'Vertical': row['Vertical'],
+        'Sub Vertical': row['Sub Vertical'],
+        'Type': row['Type'],
+        'Functional Expertise': row['Functional Expertise'],
+        'Physical Address': row['Physical Address'],
+        'Latitude': row['Latitude'],
+        'Longitude': row['Longitude'],
+        'License': row['License'],
+        'FFM': row['FFM']
+    })
 
-# ----------Configure dataframe display configuration--------------
-df = pd.DataFrame()
+# Function to extract text from uploaded files
+def extract_text_from_file(file):
+    if file.type == "application/pdf":
+        pdf = PdfReader(file)
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text()
+        return text
+    elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        return docx2txt.process(file)
+    else:
+        return ""
 
-column_configuration = {
-    "Title": st.column_config.TextColumn(
-        "Title", help="The name of the movie", max_chars=100
-    ),
-    "Score": st.column_config.NumberColumn(
-        "Score", help="Cosine simiuarity score"
-    ),
-    "Director": st.column_config.TextColumn(
-        "Director", help="The name of the director(s)", max_chars=100
-    ),
-    "Cast": st.column_config.TextColumn(
-        "Cast", help="The top billed cast", max_chars=100
-    ),
-    "Genre": st.column_config.TextColumn(
-        "Genre", help="Movie genre(s)", max_chars=50
-    ),
-    "Wikipage": st.column_config.LinkColumn(
-        "Wikipage", help="Wikipedia link"
-    ),
-    "year": st.column_config.TextColumn(
-        "Year", help="Year of release", max_chars=50
-    ),
-   "origin": st.column_config.TextColumn(
-        "Country", help="Country of origin", max_chars=50
-    ),
-}
+# Function to get latitude and longitude for candidate address
+def get_lat_lon(address):
+    try:
+        results = geocoder.geocode(address)
+        if results and len(results):
+            return (results[0]['geometry']['lat'], results[0]['geometry']['lng'])
+    except Exception as e:
+        print(f"Error: {e}")
+    return (None, None)
 
-# by default, the vectorstore returns cosine distance. This function converts it to a similarity score
-def convertosimilarity(score):
-    return 1 - score
+# Function for similarity search using in-memory data store
+def similarity_search(query, k=3, filters=None, candidate_latlon=None, max_distance=None):
+    query_embedding = embedding.embed_query(query)
+    similarities = []
+    for key, value in data_store.items():
+        if filters:
+            match = all(value.get(filter_key) == filter_value for filter_key, filter_value in filters.items() if filter_value and filter_value != "Select")
+            if not match:
+                continue
+        
+        distance = None
+        job_latlon = (value['Latitude'], value['Longitude'])
+        if candidate_latlon and max_distance and job_latlon != (None, None) and None not in job_latlon:
+            try:
+                distance = geodesic(candidate_latlon, job_latlon).miles
+                if distance > max_distance:
+                    continue
+            except ValueError:
+                continue
 
-# ----------Streamlit app----------
-st.title('Postion Recommendation App 🎞️🍿')
+        if value.get('License') == 'TRUE' and not license_required:
+            continue
+        if value.get('FFM') == 'TRUE' and not ffm_required:
+            continue
 
+        sim = np.dot(query_embedding, value['embedding']) / (np.linalg.norm(query_embedding) * np.linalg.norm(value['embedding']))
+        similarities.append((key, sim, distance if candidate_latlon and max_distance else None))
+    
+    similarities = sorted(similarities, key=lambda x: x[1], reverse=True)
+    return similarities[:k]
+
+
+
+
+# Streamlit app
+st.set_page_config(page_title="TalentWorx", layout="centered")
+
+# Add navbar
+st.markdown("""
+    <style>
+        .navbar {
+            background-color: transparent;
+            padding: 10px;
+            margin-top: -50px;  /* Adjust this value to reduce the padding above the navbar */
+        }
+        .navbar h1 {
+            color: white;
+            margin: 0;
+        }
+    </style>
+    <nav class="navbar">
+        <h1>TalentWorx</h1>
+    </nav>
+    """, unsafe_allow_html=True)
+
+# Add banner image
+# banner_image_path = "img/reddit_background_sm.png"
+# banner_image = Image.open(banner_image_path)
+
+# def get_image_base64(image_path):
+#     with open(image_path, "rb") as img_file:
+#         return base64.b64encode(img_file.read()).decode()
+
+# banner_image_base64 = get_image_base64(banner_image_path)
+
+# st.markdown(f"""
+#     <div style="display: flex; justify-content: center; width: 75%; margin: auto;">
+#         <img src="data:image/png;base64,{banner_image_base64}" style="width: 75%;">
+#     </div>
+#     """, unsafe_allow_html=True)
+
+st.markdown("""
+    <div style="text-align: center; width: 75%; margin: auto;">
+        <h2>Position Recommendation Tool</h2>
+        <p>TalentWorx helps recruiters at Worxweb Solutions match candidates with suitable job roles efficiently. Use the tool below to describe the candidate and apply additional filters to find the best matches.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Center the form
+st.markdown("""
+    <div style="display: flex; justify-content: center;">
+    <div style="width: 75%;">
+    """, unsafe_allow_html=True)
+
+# Form
 with st.form('main_form'):
-    # Text box for query input
-    query = st.text_input("Describe the candidate?")
+    # Multiline text area for query input
+    query = st.text_area("Describe the candidate")
 
-    # Slider for number of results
-    num_results = st.slider("Number of results:", min_value=1, max_value=10, value=3)
+    # File uploader for resume
+    resume_file = st.file_uploader("Upload resume (optional)", type=["pdf", "docx"])
+
+    # Candidate address for proximity search
+    candidate_address = st.text_input("Enter candidate's address (for proximity search)")
+
+    # Slider for max distance
+    max_distance = st.slider("Maximum distance for in-person positions (miles):", min_value=0, max_value=50, value=10)
 
     # Expandable section for additional filters
-    with st.expander("Additional filters"):
-        movie_year = st.slider("Year of release:", min_value=1970, max_value=2017, value=(1970, 2017))
+    with st.expander("Position filters"):
+        status = st.selectbox("Status", options=["Select", "open"] + df['Status'].unique().tolist(), index=1)
+        vertical = st.selectbox("Vertical", options=["Select"] + df['Vertical'].unique().tolist(), index=0)
+        sub_vertical = st.selectbox("Sub Vertical", options=["Select"] + df['Sub Vertical'].unique().tolist(), index=0)
+        functional_expertise = st.selectbox("Functional Expertise", options=["Select"] + df['Functional Expertise'].unique().tolist(), index=0)
+        city = st.selectbox("City", options=["Select"] + df['City'].unique().tolist(), index=0)
+        type = st.selectbox("Type", options=["Select"] + df['Type'].unique().tolist(), index=0)
 
-        genreoptions = ('all', 'action', 'drama', 'animated', 'thriller', 'romance', 'family', 'horror', 'science fiction', 'documentary', 'western')
-        genre = st.selectbox(label='Movie genre', options = genreoptions)
+    # Candidate has License and FFM
+    license_required = st.checkbox("Candidate has License", value=False)
+    ffm_required = st.checkbox("Candidate has FFM", value=False)
 
     # Submit button
     submitted = st.form_submit_button('Search')
 
     if submitted:
-        # filter results based on filter parameters
-        is_genre = RedisText("Genre") == genre
-        is_year = (RedisNum("year") >= movie_year[0]) & (RedisNum("year") <= movie_year[1])
+        filters = {
+            'Status': status if status != "Select" else None,
+            'Vertical': vertical if vertical != "Select" else None,
+            'Sub Vertical': sub_vertical if sub_vertical != "Select" else None,
+            'Functional Expertise': functional_expertise if functional_expertise != "Select" else None,
+            'City': city if city != "Select" else None,
+            'Type': type if type != "Select" else None
+        }
 
-        # if genre is 'all', only filter on year
-        if genre == 'all':
-            is_filter = is_year
-        else:
-            is_filter = is_genre & is_year
+        # Process resume file if uploaded
+        if resume_file:
+            resume_text = extract_text_from_file(resume_file)
+            query += " " + resume_text
 
-        # perform vector search
-        results = vectorstore.similarity_search_with_score(query, k=num_results, filter=is_filter)
+        # Get candidate latitude and longitude if address is provided
+        candidate_latlon = get_lat_lon(candidate_address) if candidate_address else None
 
-        topanswer = results[0][0].metadata['Title']
-        topwikipage = results[0][0].metadata['Wiki Page']
-        topscore = results[0][1]
+        results = similarity_search(query, k=3, filters=filters, candidate_latlon=candidate_latlon, max_distance=max_distance)
 
-        # get movie poster image URL
-        posterquery = topanswer + " movie poster"
-        url = bing_image_urls(posterquery, limit=1)[0]
+        # Results display
+        st.write("Results:")
+        for result in results:
+            job = data_store[result[0]]
+            distance_str = ""
+            job_latlon = (job.get('Latitude'), job.get('Longitude'))
+            if candidate_latlon and job_latlon != (None, None) and None not in job_latlon:
+                distance = geodesic(candidate_latlon, job_latlon).miles
+                distance_str = f" (Distance: {distance:.2f} miles)"
+            st.write(f"{job['company']} - {job['position']}, Similarity: {result[1]}{distance_str}")
+            st.write(f"Description: {job['description']}")
+            st.write(f"City: {job['City']}, Zip: {job['Zip']}, Status: {job['Status']}, Vertical: {job['Vertical']}, Sub Vertical: {job['Sub Vertical']}, Type: {job['Type']}, Functional Expertise: {job['Functional Expertise']}, Physical Address: {job['Physical Address']}")
+            st.write("---")
 
-        # display top result
-        st.header("Your top result:")
-        st.divider()
-        st.subheader(topanswer)
-        st.image(url, width=200)
-        st.write("Wikipedia page: " + topwikipage)
-        st.write("Score: " + str(convertosimilarity(topscore)))
+        if not results:
+            st.write("No results found.")
 
-        # add the cosine similarity score to dataframe
-        scorelist = []
-
-        for movie, score in results:
-            df.loc[len(df.index), list(movie.metadata.keys())] = list(movie.metadata.values())
-            scorelist.append(convertosimilarity(score))
-
-        df.insert(0, 'Score', scorelist)
-
-        # drop columns that are not needed
-        df = df.drop(columns=['id', 'n_tokens'])
-
-        # display all results using a dataframe
-        st.divider()
-        st.write("All results:")
-        st.dataframe(df, hide_index=True, column_config=column_configuration)
+st.markdown("</div></div>", unsafe_allow_html=True)
