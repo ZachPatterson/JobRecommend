@@ -80,3 +80,4 @@ python-dotenv==1.0.0
 beautifulsoup4  # Corrected 'bs4' to the actual package name
 opencage==2.0.0  # Ensure you have the correct version
 PyPDF2==2.12.0   # Corrected 'PdfReader' to the actual package name
+geopy==2.2.0
