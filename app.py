@@ -1,20 +1,27 @@
 import streamlit as st
-from langchain.embeddings import OpenAIEmbeddings
-import pandas as pd
+import numpy as np
 import os
 from dotenv import load_dotenv
-import re
-import numpy as np
-from PIL import Image
-import base64
-from io import BytesIO
-import docx2txt
-from PyPDF2 import PdfReader
 from geopy.distance import geodesic
 from opencage.geocoder import OpenCageGeocode
+import redis
+import json
+from PyPDF2 import PdfReader
+import docx2txt
+from langchain.embeddings import OpenAIEmbeddings
+
+# # Set up debugpy for debugging
+# debugpy.listen(("localhost", 5678))
+# print("Waiting for debugger attach...")
+# debugpy.wait_for_client()
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Define weights
+SIMILARITY_WEIGHT = 0.8
+PROXIMITY_WEIGHT = 0.1
+INPERSON_BONUS = 0.1
 
 # Set up Azure OpenAI Embeddings
 OPENAI_ENDPOINT = os.environ.get("OPENAI_ENDPOINT")
@@ -22,6 +29,8 @@ OPENAI_KEY = os.environ.get("OPENAI_KEY")
 DEPLOYMENT_NAME = os.environ.get("DEPLOYMENT_NAME")
 MODEL_NAME = os.environ.get("MODEL_NAME")
 OPENCAGE_KEY = os.environ.get("OPENCAGE_KEY")
+REDIS_ENDPOINT = os.environ.get("REDIS_ENDPOINT")
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
 
 geocoder = OpenCageGeocode(OPENCAGE_KEY)
 
@@ -35,41 +44,19 @@ embedding = OpenAIEmbeddings(
     chunk_size=16
 )
 
-# In-memory data store
-data_store = {}
+# Connect to Redis
+r = redis.StrictRedis(host=REDIS_ENDPOINT, port=6380, password=REDIS_PASSWORD, ssl=True)
 
-# Function to add data to the store
-def add_to_store(key, value):
-    data_store[key] = value
+if 'feedback' not in st.session_state:
+    st.session_state['feedback'] = {}
 
-# Load the processed CSV file
-csv_file_path = 'data/Client Knowledge Base Processed.csv'
-df = pd.read_csv(csv_file_path, encoding='ISO-8859-1')
-
-# Add data to the in-memory store with embeddings
-for _, row in df.iterrows():
-    key = f"{row['Client Name']}_{row['Position']}"
-    description = row['Description']
-    embedding_vector = embedding.embed_query(description)
-    add_to_store(key, {
-        'id': row['id'],
-        'company': row['Client Name'],
-        'position': row['Position'],
-        'description': description,
-        'embedding': embedding_vector,
-        'City': row['City'],
-        'Zip': row['Zip'],
-        'Status': row['Status'],
-        'Vertical': row['Vertical'],
-        'Sub Vertical': row['Sub Vertical'],
-        'Type': row['Type'],
-        'Functional Expertise': row['Functional Expertise'],
-        'Physical Address': row['Physical Address'],
-        'Latitude': row['Latitude'],
-        'Longitude': row['Longitude'],
-        'License': row['License'],
-        'FFM': row['FFM']
-    })
+# Function to normalize proximity score
+def normalize_proximity(distance, max_distance):
+    if distance is None:
+        return 0
+    if max_distance == 0:
+        return 1
+    return max(0, min(1, 1 - (distance / max_distance)))
 
 # Function to extract text from uploaded files
 def extract_text_from_file(file):
@@ -94,39 +81,116 @@ def get_lat_lon(address):
         print(f"Error: {e}")
     return (None, None)
 
-# Function for similarity search using in-memory data store
-def similarity_search(query, k=3, filters=None, candidate_latlon=None, max_distance=None):
+# Function for similarity search using Redis data store
+def similarity_search(query, k=3, filters=None, candidate_latlon=None, max_distance=None, candidate_license=False, candidate_ffm=False):
     query_embedding = embedding.embed_query(query)
     similarities = []
-    for key, value in data_store.items():
-        if filters:
-            match = all(value.get(filter_key) == filter_value for filter_key, filter_value in filters.items() if filter_value and filter_value != "Select")
-            if not match:
-                continue
-        
-        distance = None
-        job_latlon = (value['Latitude'], value['Longitude'])
-        if candidate_latlon and max_distance and job_latlon != (None, None) and None not in job_latlon:
-            try:
-                distance = geodesic(candidate_latlon, job_latlon).miles
-                if distance > max_distance:
+
+    # Start scanning with an initial cursor value of '0'
+    cursor = 0
+    while True:  # Begin infinite loop
+        cursor, keys = r.scan(cursor=cursor, match='job:*')  # Scan Redis keys
+        for key in keys:  # Process each key in the current batch
+            value = json.loads(r.get(key))  # Get the value from Redis
+
+            # Check if job requires License or FFM and if candidate meets these requirements
+            requires_license = value.get('License')
+            requires_ffm = value.get('FFM')
+
+            if (requires_license and not candidate_license) or (requires_ffm and not candidate_ffm):
+                continue  # Skip this job if it requires a license/FFM that the candidate doesn't have
+            
+            # Calculate proximity if applicable
+            distance = None
+            job_latlon = (value['Latitude'], value['Longitude'])
+            is_remote = value['Type'] == 'remote'
+            if candidate_latlon and job_latlon != (None, None) and None not in job_latlon and not is_remote:
+                try:
+                    distance = geodesic(candidate_latlon, job_latlon).miles
+                    if distance > max_distance:
+                        continue
+                except ValueError:
                     continue
-            except ValueError:
-                continue
+            
+            # Compute scores and composite score
+            job_embedding = np.array(value['embedding'])
+            similarity_score = np.dot(query_embedding, job_embedding) / (np.linalg.norm(query_embedding) * np.linalg.norm(job_embedding))
+            proximity_score = normalize_proximity(distance, max_distance) if distance is not None else 0
+            job_type_score = INPERSON_BONUS if not is_remote else 0
+            composite_score = SIMILARITY_WEIGHT * similarity_score + PROXIMITY_WEIGHT * proximity_score + job_type_score
+            
+            # Append results
+            similarities.append((key, composite_score, similarity_score, proximity_score, distance if candidate_latlon and max_distance else None, is_remote))
+        
+        # Check if all keys have been scanned (cursor == '0' means end of data)
+        if cursor == 0:
+            break  # Exit the loop
 
-        if value.get('License') == 'TRUE' and not license_required:
-            continue
-        if value.get('FFM') == 'TRUE' and not ffm_required:
-            continue
-
-        sim = np.dot(query_embedding, value['embedding']) / (np.linalg.norm(query_embedding) * np.linalg.norm(value['embedding']))
-        similarities.append((key, sim, distance if candidate_latlon and max_distance else None))
-    
+    # Sort and return the top k results
     similarities = sorted(similarities, key=lambda x: x[1], reverse=True)
     return similarities[:k]
 
 
+# Function to store feedback in Redis
+def store_feedback(query, job_id, feedback):
+    query_embedding = embedding.embed_query(query)
+    feedback_data = {
+        'query': query,
+        'candidate_embedding': query_embedding.tolist(),
+        'job_id': job_id,
+        'feedback': feedback
+    }
+    r.rpush('feedback', json.dumps(feedback_data))
 
+def get_unique_values(field):
+    cache_key = f"unique_values:{field}"
+    cached_values = r.get(cache_key)
+    if cached_values:
+        return json.loads(cached_values)
+
+    cursor = 0
+    unique_values = set()
+    while True:
+        cursor, keys = r.scan(cursor=cursor, match='job:*')
+        for key in keys:
+            value = json.loads(r.get(key))
+            field_value = value.get(field)
+            if field_value:
+                unique_values.add(field_value)
+        if cursor == 0:
+            break
+
+    unique_values = sorted(unique_values)
+    r.set(cache_key, json.dumps(unique_values), ex=3600)  # Cache for 1 hour
+    return unique_values
+
+# Function to adjust embeddings based on feedback
+def adjust_embeddings():
+    feedback_list = r.lrange('feedback', 0, -1)
+    for feedback in feedback_list:
+        feedback = json.loads(feedback)
+        query_embedding = np.array(feedback['candidate_embedding'])
+        job_id = feedback['job_id']
+        job_data = json.loads(r.get(f"job:{job_id}"))
+        job_embedding = np.array(job_data['embedding'])
+        if feedback['feedback'] == 'yes':
+            # Decrease distance between embeddings
+            job_embedding += 0.01 * (query_embedding - job_embedding)
+        elif feedback['feedback'] == 'no':
+            # Increase distance between embeddings
+            job_embedding -= 0.01 * (query_embedding - job_embedding)
+        
+        job_data['embedding'] = job_embedding.tolist()
+        r.set(f"job:{job_id}", json.dumps(job_data))
+
+    r.delete('feedback')  # Clear feedback after applying
+# Get unique values for each filter
+unique_status = ["Select"] + get_unique_values('Status')
+unique_type = ["Select"] + get_unique_values('Type')
+unique_vertical = ["Select"] + get_unique_values('Vertical')
+unique_sub_vertical = ["Select"] + get_unique_values('Sub Vertical')
+unique_functional_expertise = ["Select"] + get_unique_values('Functional Expertise')
+unique_city = ["Select"] + get_unique_values('City')
 
 # Streamlit app
 st.set_page_config(page_title="TalentWorx", layout="centered")
@@ -148,22 +212,6 @@ st.markdown("""
         <h1>TalentWorx</h1>
     </nav>
     """, unsafe_allow_html=True)
-
-# Add banner image
-# banner_image_path = "img/reddit_background_sm.png"
-# banner_image = Image.open(banner_image_path)
-
-# def get_image_base64(image_path):
-#     with open(image_path, "rb") as img_file:
-#         return base64.b64encode(img_file.read()).decode()
-
-# banner_image_base64 = get_image_base64(banner_image_path)
-
-# st.markdown(f"""
-#     <div style="display: flex; justify-content: center; width: 75%; margin: auto;">
-#         <img src="data:image/png;base64,{banner_image_base64}" style="width: 75%;">
-#     </div>
-#     """, unsafe_allow_html=True)
 
 st.markdown("""
     <div style="text-align: center; width: 75%; margin: auto;">
@@ -194,55 +242,100 @@ with st.form('main_form'):
 
     # Expandable section for additional filters
     with st.expander("Position filters"):
-        status = st.selectbox("Status", options=["Select", "open"] + df['Status'].unique().tolist(), index=1)
-        vertical = st.selectbox("Vertical", options=["Select"] + df['Vertical'].unique().tolist(), index=0)
-        sub_vertical = st.selectbox("Sub Vertical", options=["Select"] + df['Sub Vertical'].unique().tolist(), index=0)
-        functional_expertise = st.selectbox("Functional Expertise", options=["Select"] + df['Functional Expertise'].unique().tolist(), index=0)
-        city = st.selectbox("City", options=["Select"] + df['City'].unique().tolist(), index=0)
-        type = st.selectbox("Type", options=["Select"] + df['Type'].unique().tolist(), index=0)
+        status = st.selectbox("Status", options=unique_status, index=0)
+        type = st.selectbox("Type", options=unique_type, index=0)
+        vertical = st.selectbox("Vertical", options=unique_vertical, index=0)
+        sub_vertical = st.selectbox("Sub Vertical", options=unique_sub_vertical, index=0)
+        functional_expertise = st.selectbox("Functional Expertise", options=unique_functional_expertise, index=0)
+        city = st.selectbox("City", options=unique_city, index=0)
 
     # Candidate has License and FFM
-    license_required = st.checkbox("Candidate has License", value=False)
-    ffm_required = st.checkbox("Candidate has FFM", value=False)
+    candidate_license = st.checkbox("Candidate has License", value=False)
+    candidate_ffm = st.checkbox("Candidate has FFM", value=False)
 
     # Submit button
     submitted = st.form_submit_button('Search')
 
-    if submitted:
-        filters = {
-            'Status': status if status != "Select" else None,
-            'Vertical': vertical if vertical != "Select" else None,
-            'Sub Vertical': sub_vertical if sub_vertical != "Select" else None,
-            'Functional Expertise': functional_expertise if functional_expertise != "Select" else None,
-            'City': city if city != "Select" else None,
-            'Type': type if type != "Select" else None
-        }
+if submitted:
+    filters = {
+        'Status': status if status != "Select" else None,
+        'Vertical': vertical if vertical != "Select" else None,
+        'Sub Vertical': sub_vertical if sub_vertical != "Select" else None,
+        'Functional Expertise': functional_expertise if functional_expertise != "Select" else None,
+        'City': city if city != "Select" else None,
+        'Type': type if type != "Select" else None,
+    }
 
-        # Process resume file if uploaded
-        if resume_file:
-            resume_text = extract_text_from_file(resume_file)
-            query += " " + resume_text
+    # Process resume file if uploaded
+    if resume_file:
+        resume_text = extract_text_from_file(resume_file)
+        query += " " + resume_text
 
-        # Get candidate latitude and longitude if address is provided
-        candidate_latlon = get_lat_lon(candidate_address) if candidate_address else None
+    # Get candidate latitude and longitude if address is provided
+    candidate_latlon = get_lat_lon(candidate_address) if candidate_address else None
 
-        results = similarity_search(query, k=3, filters=filters, candidate_latlon=candidate_latlon, max_distance=max_distance)
+if submitted:
+    results = similarity_search(query, k=3, filters=filters, candidate_latlon=candidate_latlon, max_distance=max_distance, candidate_license=candidate_license, candidate_ffm=candidate_ffm)
 
-        # Results display
-        st.write("Results:")
+    # Results display handling
+    # Your code to display the results here
+
+    # Results display
+    st.write("Results:")
+    if results:
         for result in results:
-            job = data_store[result[0]]
-            distance_str = ""
-            job_latlon = (job.get('Latitude'), job.get('Longitude'))
-            if candidate_latlon and job_latlon != (None, None) and None not in job_latlon:
-                distance = geodesic(candidate_latlon, job_latlon).miles
-                distance_str = f" (Distance: {distance:.2f} miles)"
-            st.write(f"{job['company']} - {job['position']}, Similarity: {result[1]}{distance_str}")
-            st.write(f"Description: {job['description']}")
-            st.write(f"City: {job['City']}, Zip: {job['Zip']}, Status: {job['Status']}, Vertical: {job['Vertical']}, Sub Vertical: {job['Sub Vertical']}, Type: {job['Type']}, Functional Expertise: {job['Functional Expertise']}, Physical Address: {job['Physical Address']}")
-            st.write("---")
+            job = json.loads(r.get(result[0]))
+            distance = result[4]  # Assuming result[4] holds the distance
+            similarity_score = result[2]  # Assuming result[2] holds the similarity score
+            proximity_score = result[3]  # Assuming result[3] holds the proximity score
+            composite_score = result[1]  # Assuming result[1] holds the composite score
 
-        if not results:
-            st.write("No results found.")
+            city = "N/A" if job['Type'] == 'remote' else job['City']
+            zip_code = "N/A" if job['Type'] == 'remote' else job['Zip']
+
+            st.write(f"**Company:** {job['company']}")
+            st.write(f"**Position:** {job['position']}")
+            st.write(f"**Similarity Score:** {similarity_score:.4f}")
+            st.write(f"**Proximity Score:** {proximity_score:.4f} (Adjusted)")
+            st.write(f"**Composite Score:** {composite_score:.4f}")
+            if distance is not None:
+                st.write(f"**Distance:** {distance:.2f} miles")
+            st.write(f"**Description:** {job['description']}")
+            st.write(f"**City:** {city}, **Zip:** {zip_code}")
+            st.write(f"**Status:** {job['Status']}, **Vertical:** {job['Vertical']}")
+            st.write(f"**Sub Vertical:** {job['Sub Vertical']}")
+            st.write(f"**Type:** {job['Type']}, **Functional Expertise:** {job['Functional Expertise']}")
+            st.write(f"**Physical Address:** {job['Physical Address']}")
+
+            # Feedback section
+            feedback_key = f"feedback_{result[0]}"
+            if feedback_key not in st.session_state:
+                st.session_state[feedback_key] = None
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button('👍', key=f"yes_{result[0]}"):
+                    st.session_state[feedback_key] = 'yes'
+                    store_feedback(query, job['id'], 'yes')
+                    st.write("Thank you for your feedback!")
+            with col2:
+                if st.button('👎', key=f"no_{result[0]}"):
+                    st.session_state[feedback_key] = 'no'
+                    store_feedback(query, job['id'], 'no')
+                    st.write("Thank you for your feedback!")
+
+            # Display current feedback status
+            if st.session_state[feedback_key] == 'yes':
+                st.write("Feedback: 👍")
+            elif st.session_state[feedback_key] == 'no':
+                st.write("Feedback: 👎")
+            st.write("---")
+    else:
+        st.write("No results found.")
+
+# # Option to adjust embeddings based on collected feedback
+# if st.button("Adjust Embeddings"):
+#     adjust_embeddings()
+#     st.write("Embeddings adjusted with new feedback.")
 
 st.markdown("</div></div>", unsafe_allow_html=True)

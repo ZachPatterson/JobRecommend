@@ -4,15 +4,42 @@ import re
 from dotenv import load_dotenv
 from opencage.geocoder import OpenCageGeocode
 import time
+import redis
+import json
+from langchain.embeddings import OpenAIEmbeddings
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Set up OpenCage Geocoder
-opencage_key = os.getenv("OPENCAGE_KEY")  # Ensure your .env file contains OPENCAGE_KEY
-geocoder = OpenCageGeocode(opencage_key)
+# Constants
+OPENCAGE_KEY = os.getenv("OPENCAGE_KEY")
+OPENAI_ENDPOINT = os.getenv("OPENAI_ENDPOINT")
+OPENAI_KEY = os.getenv("OPENAI_KEY")
+DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME")
+MODEL_NAME = os.getenv("MODEL_NAME")
+REDIS_ENDPOINT = os.getenv("REDIS_ENDPOINT")
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+DATA_FILE = os.path.join(os.getcwd(), 'data', 'Client Knowledge Base.csv')
+EXPORT_FILE = os.path.join(os.getcwd(), 'data', 'Processed Client Knowledge Base.csv')
 
-# Function to normalize text
+# Set up OpenCage Geocoder
+geocoder = OpenCageGeocode(OPENCAGE_KEY)
+
+# Set up Azure OpenAI Embeddings
+embedding = OpenAIEmbeddings(
+    deployment=DEPLOYMENT_NAME,
+    model=MODEL_NAME,
+    openai_api_base=OPENAI_ENDPOINT,
+    openai_api_type="azure",
+    openai_api_key=OPENAI_KEY,
+    openai_api_version="2023-05-15",
+    chunk_size=16
+)
+
+# Set up Redis
+r = redis.StrictRedis(host=REDIS_ENDPOINT, port=6380, password=REDIS_PASSWORD, ssl=True)
+
+# Methods
 def normalize_text(s):
     s = re.sub(r'\s+', ' ', s).strip()
     s = re.sub(r". ,", "", s)
@@ -22,13 +49,6 @@ def normalize_text(s):
     s = s.strip()
     return s
 
-# Read in the data
-df = pd.read_csv(os.path.join(os.getcwd(), 'data/Client Knowledge Base.csv'), encoding='ISO-8859-1')
-
-# Clean and normalize
-df.insert(0, 'id', range(0, len(df)))
-
-# Normalize addresses
 def extract_city(address):
     try:
         parts = address.split(',')
@@ -44,12 +64,35 @@ def extract_zip(address):
     except:
         return ""
 
-df['City'] = df['Physical Address'].apply(lambda x: extract_city(x) if pd.notna(x) else "")
-df['Zip'] = df['Physical Address'].apply(lambda x: extract_zip(x) if pd.notna(x) else "")
-
-# Clean categorical columns
 def clean_categorical_column(column):
     return column.str.strip().str.lower().str.replace(' ', '_').str.replace('-', '_').str.replace('&', 'and').str.replace('/', '_').str.replace('\\', '_')
+
+def get_lat_lon(address, retries=3, delay=5):
+    for _ in range(retries):
+        try:
+            result = geocoder.geocode(address)
+            if result and len(result):
+                location = result[0]['geometry']
+                return (location['lat'], location['lng'])
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(delay)
+    return (None, None)
+
+# Main script
+# Clear the Redis cache
+r.flushdb()
+print("Flushed Redis Cache.")
+
+# Read in the data
+df = pd.read_csv(DATA_FILE, encoding='ISO-8859-1')
+print("Data read. Cleaning and normalizing.")
+
+# Clean and normalize
+df.insert(0, 'id', range(0, len(df)))
+
+df['City'] = df['Physical Address'].apply(lambda x: extract_city(x) if pd.notna(x) else "")
+df['Zip'] = df['Physical Address'].apply(lambda x: extract_zip(x) if pd.notna(x) else "")
 
 df['Status'] = clean_categorical_column(df['Status'])
 df['Vertical'] = clean_categorical_column(df['Vertical'])
@@ -57,7 +100,6 @@ df['Sub Vertical'] = clean_categorical_column(df['Sub Vertical'])
 df['Functional Expertise'] = clean_categorical_column(df['Functional Expertise'])
 df['Type'] = clean_categorical_column(df['Type'])
 
-# Create a description column by concatenating relevant columns
 df['Description'] = df.apply(lambda row: (
     f"{row['Position']} at {row['Client Name']}, located at {row['Physical Address']} ({row['Zip']}). "
     f"Status: {row['Status']}. Vertical: {row['Vertical']}, Sub Vertical: {row['Sub Vertical']}. "
@@ -72,10 +114,8 @@ df['Description'] = df.apply(lambda row: (
     f"Job URL: {row['Job URL']}, Hot: {row['Hot']}, Hire Rate: {row['Hire Rate']}, 4 week attrition rate: {row['4 week attrition rate']}."
 ), axis=1)
 
-# Apply normalization
 df['Description'] = df['Description'].astype(str).apply(lambda x: normalize_text(x))
 
-# Create info column with descriptive descriptions about the type of person that would be a good fit for these roles
 df['Info'] = df.apply(lambda row: (
     f"A suitable candidate for {row['Position']} at {row['Client Name']} would likely have experience in {row['Vertical']} "
     f"and {row['Sub Vertical']} verticals, with at least {row['Min High Pressure Phone Sales Experience  (Months)']} months of "
@@ -85,23 +125,38 @@ df['Info'] = df.apply(lambda row: (
     f"The position is available in the following states: {row['States']}."
 ), axis=1)
 
-# Function to get latitude and longitude
-def get_lat_lon(address, retries=3, delay=5):
-    for _ in range(retries):
-        try:
-            result = geocoder.geocode(address)
-            if result and len(result):
-                location = result[0]['geometry']
-                return (location['lat'], location['lng'])
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(delay)
-    return (None, None)
+df['Candidate Description'] = df['Candidate Description'].astype(str).apply(lambda x: normalize_text(x))
 
-# Get latitudes and longitudes for job locations
+print("Getting LatLon from physical address.")
 df['LatLon'] = df['Physical Address'].apply(lambda x: get_lat_lon(x) if pd.notna(x) and x.strip() else (None, None))
 df[['Latitude', 'Longitude']] = pd.DataFrame(df['LatLon'].tolist(), index=df.index)
 
-# Save the processed data to a new CSV file
-df.to_csv(os.path.join(os.getcwd(), 'data/Client Knowledge Base Processed.csv'), index=False)
-print("Data processing complete.")
+print("Embedding descriptions.")
+embeddings = []
+for _, row in df.iterrows():
+    job_data = {
+        'id': row['id'],
+        'company': row['Client Name'],
+        'position': row['Position'],
+        'description': row['Description'],
+        'City': row['City'],
+        'Zip': row['Zip'],
+        'Status': row['Status'],
+        'Vertical': row['Vertical'],
+        'Sub Vertical': row['Sub Vertical'],
+        'Type': row['Type'],
+        'Functional Expertise': row['Functional Expertise'],
+        'Physical Address': row['Physical Address'],
+        'Latitude': row['Latitude'],
+        'Longitude': row['Longitude'],
+        'License': row['License'],
+        'FFM': row['FFM'],
+        'embedding': embedding.embed_query(row['Candidate Description'])
+    }
+    embeddings.append(job_data)
+    r.set(f"job:{row['id']}", json.dumps(job_data))
+
+# Create a DataFrame with the embeddings and export to CSV
+embeddings_df = pd.DataFrame(embeddings)
+embeddings_df.to_csv(EXPORT_FILE, index=False)
+print(f"Data processing complete. Exported data to {EXPORT_FILE}.")

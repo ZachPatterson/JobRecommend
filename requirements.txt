@@ -95,3 +95,4 @@ python-dotenv==1.0.0
 re
 bs4
 opencage
+PdfReader

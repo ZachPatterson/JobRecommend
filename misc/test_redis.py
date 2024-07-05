@@ -1,17 +1,20 @@
 import redis
-import os
 from dotenv import load_dotenv
+import os
 
 # Load environment variables from .env file
 load_dotenv()
 
-redis_url = f"rediss://:{os.environ['REDIS_PASSWORD']}@{os.environ['REDIS_ENDPOINT']}"
+# Set up Redis
+redis_endpoint = os.getenv("REDIS_ENDPOINT")
+redis_password = os.getenv("REDIS_PASSWORD")
 
+# Connect to Redis
 try:
-    redis_client = redis.StrictRedis.from_url(redis_url, socket_connect_timeout=20, socket_timeout=10)
-    redis_client.ping()
+    r = redis.StrictRedis(host=redis_endpoint, port=6380, password=redis_password, ssl=True)
+    r.ping()
     print("Connected to Redis successfully!")
-except redis.exceptions.TimeoutError:
-    print("Timeout connecting to Redis")
+except redis.exceptions.AuthenticationError:
+    print("Invalid username-password pair.")
 except Exception as e:
-    print(f"Failed to connect to Redis: {e}")
+    print(f"An error occurred: {e}")
